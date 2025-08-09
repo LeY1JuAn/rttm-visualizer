@@ -29,4 +29,7 @@ SPEAKER file 1 12.34 3.21 <NA> <NA> spk1 <NA>
 Hover tooltip in the UI shows “start–end (duration)” for clarity.
 
 ## Related
+
+Here are some awesome speaker diarization repos to explore.
+
 - [modelscope/3D-Speaker](https://github.com/modelscope/3D-Speaker) — a state-of-the-art, comprehensive toolkit for speaker verification, recognition, and diarization. 
