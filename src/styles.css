@@ -32,7 +32,13 @@ body {
 .panel { background: rgba(21,24,33,0.7); border-right:1px solid var(--border); width: 300px; overflow:auto; transition: width 0.2s ease; }
 .panel.collapsed { width: 0; padding: 0; border: none; }
 .panel.right { border-left:1px solid var(--border); border-right:none; }
-.center { flex:1; display:flex; flex-direction: column; min-width: 0; }
+.panel.right.collapsed { width: 0; padding: 0; border: none; }
+.center { flex:1; display:flex; flex-direction: column; min-width: 0; min-height: 0; }
+.center .resizer {
+  height: 8px;
+  cursor: row-resize;
+  background: transparent;
+}
 
 .section { padding: 16px; }
 .card { border:1px solid var(--border); border-radius: 12px; background: var(--panel); padding: 12px; }
@@ -65,7 +71,13 @@ body {
 .video-wrap { border:1px solid var(--border); border-radius: 12px; overflow:hidden; background: var(--panel); }
 .controls-bar { display:flex; align-items:center; gap:8px; padding: 10px; border-top:1px solid var(--border); background: var(--panel-2); }
 
-.timeline-wrap { padding: 12px; }
+.timeline-wrap {
+  padding: 12px;
+  /* Fill remaining height and stick to bottom within center column */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
 .timeline {
   position: relative; border:1px solid var(--border); border-radius: 10px; background: #0e1016;
   overflow-x: auto; overflow-y: hidden; white-space: nowrap; /* only timeline scrolls horizontally */
@@ -79,15 +91,8 @@ body {
 .playhead { position:absolute; top:0; bottom:0; width:2px; background: var(--danger); pointer-events:none; }
 
 /* Long playhead spanning speaker tracks area */
-.playhead-long {
-  position: absolute;
-  top: 24px; /* below ruler */
-  bottom: 0;
-  width: 2px;
-  background: var(--danger);
-  pointer-events: none;
-  z-index: 2;
-}
+.tracks { position: relative; display: flex; flex-direction: column; min-height: 0; height: calc(100% - 24px); }
+.playhead-long { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--danger); pointer-events: none; z-index: 2; }
 
 .track { position: relative; height: 28px; background:#121624; border-top:1px solid #20263a; }
 .seg { position:absolute; top:3px; bottom:3px; border-radius: 4px; opacity: 0.9; }

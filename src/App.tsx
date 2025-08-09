@@ -69,6 +69,11 @@ function parseRTTM(text:string): {segments:Segment[], speakers:Speaker[]} {
 
 const sampleVideo = "https://videos.pexels.com/video-files/30333849/13003128_2560_1440_25fps.mp4"
 
+// Load local defaults from exp/ using Vite glob imports
+// RTTM as raw text; media as URLs (new options: query/import)
+const defaultRttmFiles = import.meta.glob('/exp/rttm/*.rttm', { eager: true, query: '?raw', import: 'default' }) as Record<string, string>
+const defaultMediaFiles = import.meta.glob('/exp/raw/*.{mp4,webm,mp3,wav,m4a}', { eager: true, query: '?url', import: 'default' }) as Record<string, string>
+
 export default function App(){
   const [title] = useState('RTTM Visualizer') // 1) Title updated
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -81,6 +86,12 @@ export default function App(){
   const [segments, setSegments] = useState<Segment[]>([])
   const [speakers, setSpeakers] = useState<Speaker[]>([])
   const [leftCollapsed, setLeftCollapsed] = useState(false)
+  const [rightCollapsed, setRightCollapsed] = useState(false)
+  const centerRef = useRef<HTMLDivElement>(null)
+  const [videoAreaHeight, setVideoAreaHeight] = useState<number>(320)
+  const resizeStateRef = useRef<{startY:number; startH:number} | null>(null)
+  const isScrubbingRef = useRef(false)
+  const defaultLoadedRef = useRef(false)
 
   // drag-n-drop upload
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -128,6 +139,36 @@ export default function App(){
     const el = videoRef.current; if(!el) return
     setDuration(el.duration || 0)
   }
+
+  // Load default media and RTTM from exp/ folders on first mount
+  useEffect(()=>{
+    if(defaultLoadedRef.current) return
+    defaultLoadedRef.current = true
+    try {
+      const mediaKeys = Object.keys(defaultMediaFiles).sort()
+      if(mediaKeys.length > 0){
+        const mp4First = mediaKeys.find(k=>/\.mp4$/i.test(k)) || mediaKeys[0]
+        const url = defaultMediaFiles[mp4First]
+        const name = mp4First.split('/').pop() || 'media'
+        const type: MediaType = /\.(mp4|webm)$/i.test(name) ? 'video' : 'audio'
+        setMedia({ id: 'default-media', name, type, url })
+      }
+      const rttmKeys = Object.keys(defaultRttmFiles).sort()
+      if(rttmKeys.length > 0){
+        const firstPath = rttmKeys[0]
+        const content = defaultRttmFiles[firstPath]
+        const name = firstPath.split('/').pop() || 'segments.rttm'
+        const parsed = parseRTTM(content)
+        setSegments(parsed.segments)
+        setSpeakers(parsed.speakers)
+        const blob = new Blob([content], {type:'text/plain'})
+        const url = URL.createObjectURL(blob)
+        setRTTM({ id: 'default-rttm', name, url, matched: true })
+      }
+    } catch (e) {
+      // ignore
+    }
+  }, [])
 
   // smoother UI updates while playing
   useEffect(()=>{
@@ -190,18 +231,74 @@ export default function App(){
     seek(t)
   }
 
-  // auto-scroll timeline to keep playhead in view
+  // Pointer-based scrubbing (press-and-hold to move playhead)
+  const scrubAtClient = (clientX: number) => {
+    const el = waveRef.current; if(!el) return
+    const rect = el.getBoundingClientRect()
+    const x = clientX - rect.left + el.scrollLeft
+    const t = x / pxPerSec
+    seek(t)
+  }
+  const onTimelinePointerDown = (e: React.PointerEvent) => {
+    isScrubbingRef.current = true
+    try { (e.target as Element).setPointerCapture?.(e.pointerId) } catch {}
+    scrubAtClient(e.clientX)
+    e.preventDefault()
+  }
+  const onTimelinePointerMove = (e: React.PointerEvent) => {
+    if(!isScrubbingRef.current) return
+    scrubAtClient(e.clientX)
+  }
+  const onTimelinePointerUp = (e: React.PointerEvent) => {
+    isScrubbingRef.current = false
+    try { (e.target as Element).releasePointerCapture?.(e.pointerId) } catch {}
+  }
+
+  // auto-scroll timeline to keep playhead in view (throttled, no repeated smooth to avoid jitter)
+  const autoScrollStateRef = useRef<{ lastTs: number; lastLeft: number }>({ lastTs: 0, lastLeft: 0 })
   useEffect(()=>{
     const el = waveRef.current; if(!el) return
     const playheadX = currentTime * pxPerSec
     const viewLeft = el.scrollLeft
     const viewRight = viewLeft + el.clientWidth
-    const margin = Math.max(60, el.clientWidth * 0.25)
-    if(playheadX < viewLeft + margin || playheadX > viewRight - margin){
-      const targetLeft = Math.max(0, playheadX - el.clientWidth / 2)
-      el.scrollTo({ left: targetLeft, behavior: 'smooth' })
-    }
+    const margin = Math.max(60, el.clientWidth * 0.2)
+
+    // Only scroll when the playhead is getting too close to the edges
+    const isNearEdge = playheadX < viewLeft + margin || playheadX > viewRight - margin
+    if(!isNearEdge) return
+
+    const now = (typeof performance !== 'undefined' ? performance.now() : Date.now())
+    const { lastTs } = autoScrollStateRef.current
+    if(now - lastTs < 80) return // throttle ~12.5 fps
+
+    const targetLeft = Math.max(0, playheadX - el.clientWidth / 2)
+    if(Math.abs(targetLeft - viewLeft) < 4) return // tiny changes ignored
+
+    el.scrollLeft = targetLeft // immediate jump to avoid interrupting smooth scroll repeatedly
+    autoScrollStateRef.current.lastTs = now
+    autoScrollStateRef.current.lastLeft = targetLeft
   }, [currentTime, pxPerSec])
+
+  // Vertical resize of video area
+  const onResizeMouseDown = (e: React.MouseEvent) => {
+    resizeStateRef.current = { startY: e.clientY, startH: videoAreaHeight }
+    const onMove = (ev: MouseEvent) => {
+      const start = resizeStateRef.current; if(!start) return
+      const centerH = centerRef.current?.clientHeight || 600
+      const minH = 140
+      const maxH = Math.max(minH, centerH - 140)
+      const next = Math.max(minH, Math.min(maxH, start.startH + (ev.clientY - start.startY)))
+      setVideoAreaHeight(next)
+    }
+    const onUp = () => {
+      resizeStateRef.current = null
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    e.preventDefault()
+  }
 
   // tooltip on hover segment
   const [tooltip, setTooltip] = useState<{x:number;y:number;text:string}|null>(null)
@@ -227,6 +324,7 @@ export default function App(){
         <div className="row">
           <button className="btn" onClick={exportJSON}><Download className="file-icon" />Export</button>
           <button className="btn" onClick={()=> setLeftCollapsed(v=>!v)}>{leftCollapsed? 'Show Left' : 'Hide Left'}</button>
+          <button className="btn" onClick={()=> setRightCollapsed(v=>!v)}>{rightCollapsed? 'Show Right' : 'Hide Right'}</button>
         </div>
       </div>
 
@@ -279,32 +377,40 @@ export default function App(){
           </div>
         </div>
 
-        {/* Center content: video + controls + timeline */}
-        <div className="center">
-          <div className="section">
-            <div className="video-wrap">
+        {/* Center content: video + controls + timeline (resizable video area, scrollable tracks) */}
+        <div className="center" ref={centerRef}>
+          {/* Video area */}
+          <div className="section" style={{paddingBottom: 0}}>
+            <div className="video-wrap" style={{height: videoAreaHeight}}>
               {media?.type === 'video' ? (
                 <video ref={videoRef} src={media.url} onTimeUpdate={onTimeUpdate} onLoadedMetadata={onLoadedMetadata}
-                  style={{width:'100%', height:'auto'}} onClick={togglePlay} controls={false} />
+                  style={{width:'100%', height:'100%', objectFit:'contain'}} onClick={togglePlay} controls={false} />
               ) : (
                 <audio ref={videoRef} src={media?.url} onTimeUpdate={onTimeUpdate} onLoadedMetadata={onLoadedMetadata} controls={false} />
               )}
-              {/* Controls moved here (2) */}
-              <div className="controls-bar">
-                <button className="btn icon" title="Previous segment" onClick={jumpPrev}><SkipBack size={16}/></button>
-                <button className="btn icon" title="Play/Pause" onClick={togglePlay}>{isPlaying? <Pause size={16}/> : <Play size={16}/>}</button>
-                <button className="btn icon" title="Next segment" onClick={jumpNext}><SkipForward size={16}/></button>
-                <div className="space" />
-                <button className="btn icon" title="Zoom Out" onClick={zoomOut}><ZoomOut size={16}/></button>
-                <input type="range" min={0.25} max={5} step={0.05} value={zoom} onChange={e=>setZoom(+e.target.value)} />
-                <button className="btn icon" title="Zoom In" onClick={zoomIn}><ZoomIn size={16}/></button>
-                <div style={{width:64, textAlign:'right'}} className="badge-sm">{zoom.toFixed(2)}x</div>
-              </div>
             </div>
           </div>
+          {/* Resizer between video and the rest */}
+          <div className="resizer" onMouseDown={onResizeMouseDown} />
+          {/* Controls bar (fixed height) */}
+          <div className="controls-bar">
+            <button className="btn icon" title="Previous segment" onClick={jumpPrev}><SkipBack size={16}/></button>
+            <button className="btn icon" title="Play/Pause" onClick={togglePlay}>{isPlaying? <Pause size={16}/> : <Play size={16}/>}</button>
+            <button className="btn icon" title="Next segment" onClick={jumpNext}><SkipForward size={16}/></button>
+            <div className="space" />
+            <button className="btn icon" title="Zoom Out" onClick={zoomOut}><ZoomOut size={16}/></button>
+            <input type="range" min={0.25} max={5} step={0.05} value={zoom} onChange={e=>setZoom(+e.target.value)} />
+            <button className="btn icon" title="Zoom In" onClick={zoomIn}><ZoomIn size={16}/></button>
+            <div style={{width:64, textAlign:'right'}} className="badge-sm">{zoom.toFixed(2)}x</div>
+          </div>
 
-          <div className="timeline-wrap">
-            <div className="timeline" ref={waveRef} onClick={onClickTimeline}>
+          {/* Timeline area fills to bottom */}
+          <div className="timeline-wrap" style={{flex: 1, minHeight: 0}}>
+            <div className="timeline" ref={waveRef} onClick={onClickTimeline}
+              onPointerDown={onTimelinePointerDown}
+              onPointerMove={onTimelinePointerMove}
+              onPointerUp={onTimelinePointerUp}
+            >
               {/* RULER */}
               <div className="ruler" style={{width: timelineWidth}}>
                 {Array.from({length: Math.ceil((duration||0)/1)+1}).map((_,i)=>{
@@ -319,31 +425,32 @@ export default function App(){
                 })}
               </div>
 
-              {/* Waveform temporarily removed */}
-              <div className="playhead-long" style={{left: `${currentTime * pxPerSec}px`}}/>
-
-              {/* SPEAKER TRACKS */}
-              {speakers.map(spk=>{
-                const hidden = !spk.visible
-                return (
-                  <div key={spk.id} className="track" style={{width: timelineWidth, opacity: hidden?0.3:1}}>
-                    {segments.filter(s=>s.speakerId===spk.id).map(seg=>{
-                      const left = seg.start * pxPerSec
-                      const w = (seg.end - seg.start) * pxPerSec
-                      const isActive = currentTime >= seg.start && currentTime < seg.end
-                      return (
-                        <div key={seg.id} className={`seg${isActive? ' active':''}`} style={{left, width:w, background: spk.color}}
-                          onMouseEnter={(e)=>{
-                            setTooltip({x: e.clientX, y: e.clientY-30, text: `${spk.name}  ${formatTime(seg.start)}–${formatTime(seg.end-seg.start)}`})
-                          }}
-                          onMouseLeave={()=>setTooltip(null)}
-                          onClick={(e)=>{ e.stopPropagation(); seek(seg.start) }}
-                        />
-                      )
-                    })}
-                  </div>
-                )
-              })}
+              {/* Tracks container fills remaining height */}
+              <div className="tracks" style={{width: timelineWidth}}>
+                <div className="playhead-long" style={{left: `${currentTime * pxPerSec}px`}}/>
+                {/* SPEAKER TRACKS (vertically scrollable) */}
+                {speakers.map(spk=>{
+                  const hidden = !spk.visible
+                  return (
+                    <div key={spk.id} className="track" style={{width: timelineWidth, opacity: hidden?0.3:1}}>
+                      {segments.filter(s=>s.speakerId===spk.id).map(seg=>{
+                        const left = seg.start * pxPerSec
+                        const w = (seg.end - seg.start) * pxPerSec
+                        const isActive = currentTime >= seg.start && currentTime < seg.end
+                        return (
+                          <div key={seg.id} className={`seg${isActive? ' active':''}`} style={{left, width:w, background: spk.color}}
+                            onMouseEnter={(e)=>{
+                              setTooltip({x: e.clientX, y: e.clientY-30, text: `${spk.name}  ${formatTime(seg.start)}–${formatTime(seg.end)} (${formatTime(seg.end-seg.start)})`})
+                            }}
+                            onMouseLeave={()=>setTooltip(null)}
+                            onClick={(e)=>{ e.stopPropagation(); seek(seg.start) }}
+                          />
+                        )
+                      })}
+                    </div>
+                  )
+                })}
+              </div>
             </div>
             {tooltip && (
               <div style={{position:'fixed', left: tooltip.x, top: tooltip.y, background:'#111827', border:'1px solid #374151', padding:'6px 8px', borderRadius:6, fontSize:12, pointerEvents:'none'}}>
@@ -353,23 +460,25 @@ export default function App(){
           </div>
         </div>
 
-        {/* Right panel: legend */}
-        <div className="panel right section">
-          <div className="card">
-            <div style={{fontWeight:700, marginBottom:8}}>Speakers</div>
-            <div className="grid" >
-              {speakers.length===0 && <div className="badge-sm">No RTTM loaded</div>}
-              {speakers.map(spk=> (
-                <div key={spk.id} className={'legend-item ' + (spk.visible? '' : 'hidden')}>
-                  <div className="color-dot" style={{background: spk.color}}/>
-                  <div style={{flex:1}}>{spk.name}</div>
-                  <button className="btn icon" onClick={()=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, visible: !s.visible}: s))}>
-                    {spk.visible ? <Eye size={14}/> : <EyeOff size={14}/>}
-                  </button>
-                </div>
-              ))}
+        {/* Right panel: legend (collapsible) */}
+        <div className={"panel right section" + (rightCollapsed ? ' collapsed' : '')}>
+          {!rightCollapsed && (
+            <div className="card">
+              <div style={{fontWeight:700, marginBottom:8}}>Speakers</div>
+              <div className="grid" >
+                {speakers.length===0 && <div className="badge-sm">No RTTM loaded</div>}
+                {speakers.map(spk=> (
+                  <div key={spk.id} className={'legend-item ' + (spk.visible? '' : 'hidden')}>
+                    <div className="color-dot" style={{background: spk.color}}/>
+                    <div style={{flex:1}}>{spk.name}</div>
+                    <button className="btn icon" onClick={()=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, visible: !s.visible}: s))}>
+                      {spk.visible ? <Eye size={14}/> : <EyeOff size={14}/>}
+                    </button>
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
     </div>
