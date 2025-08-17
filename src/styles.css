@@ -74,14 +74,15 @@ body {
 .controls-bar { display:flex; align-items:center; gap:8px; padding: 10px; border-top:1px solid var(--border); background: var(--panel-2); }
 
 .timeline-wrap {
-  padding: 12px;
+  padding: 0 12px 12px 12px;
   /* Fill remaining height and stick to bottom within center column */
-  flex: 1;
+  /* height is controlled inline to match timeline */
+  flex: 0 0 auto;
   min-height: 0;
   overflow-y: auto;
 }
 .timeline {
-  position: relative; border:1px solid var(--border); border-radius: 10px; background: #0e1016;
+  position: relative; border:1px solid var(--border); border-radius: 6px; background: #0e1016;
   overflow-x: auto; overflow-y: hidden; white-space: nowrap; /* only timeline scrolls horizontally */
 }
 .ruler { position: relative; height: 24px; border-bottom:1px solid var(--border); }

@@ -128,7 +128,7 @@ export default function App(){
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightCollapsed, setRightCollapsed] = useState(false)
   const centerRef = useRef<HTMLDivElement>(null)
-  const [videoAreaHeight, setVideoAreaHeight] = useState<number>(320)
+  const [videoAreaHeight, setVideoAreaHeight] = useState<number>(400)
   const resizeStateRef = useRef<{startY:number; startH:number} | null>(null)
   const isScrubbingRef = useRef(false)
   const defaultLoadedRef = useRef(false)
@@ -195,12 +195,44 @@ export default function App(){
     return list.length - 1
   }, [srt, currentTime])
 
-  const allSubtitles = useMemo(() => {
-    return srt?.subtitles ?? []
-  }, [srt])
+  const aroundSubtitles = useMemo(() => {
+    if (!srt?.subtitles) return [] as Array<{sub: Subtitle; isCurrent: boolean}>
+    const startIdx = Math.max(0, currentSubtitleIndex - 3)
+    const endIdx = Math.min(srt.subtitles.length, currentSubtitleIndex + 7)
+    return srt.subtitles.slice(startIdx, endIdx).map((sub) => ({ sub, isCurrent: currentSubtitle?.id === sub.id }))
+  }, [srt, currentSubtitleIndex, currentSubtitle])
+
+  const aroundListRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = aroundListRef.current
+    if (!el) return
+    const currentEl = el.querySelector('.sub-item.current') as HTMLElement | null
+    if (currentEl) currentEl.scrollIntoView({ block: 'center' })
+  }, [currentSubtitle?.id])
+
+  // Default tracks when no RTTM is loaded
+  const defaultTracks = useMemo(() => {
+    if (speakers.length > 0) return []
+    const palette = ['#3B82F6','#EF4444','#10B981','#F59E0B','#8B5CF6','#06B6D4','#84CC16','#EC4899','#14B8A6','#F472B6']
+    return Array.from({length: 10}).map((_, i) => ({
+      id: `default-${i+1}`,
+      name: `Track ${i+1}`,
+      color: palette[i % palette.length],
+      visible: true,
+    }))
+  }, [speakers.length])
+
+  // All tracks (RTTM speakers + default tracks)
+  const allTracks = useMemo(() => {
+    if (speakers.length > 0) return speakers
+    return defaultTracks
+  }, [speakers, defaultTracks])
 
   // search query for subtitles
   const [subtitleQuery, setSubtitleQuery] = useState('')
+  const allSubtitles = useMemo(() => {
+    return srt?.subtitles ?? []
+  }, [srt])
   const visibleSubtitles = useMemo(() => {
     const q = subtitleQuery.trim().toLowerCase()
     if (!q) return allSubtitles
@@ -214,14 +246,6 @@ export default function App(){
     if(!hasRTTM && !hasSRT) setRightCollapsed(true)
     else setRightCollapsed(false)
   }, [hasRTTM, hasSRT])
-
-  const aroundListRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    const el = aroundListRef.current
-    if (!el) return
-    const currentEl = el.querySelector('.sub-item.current') as HTMLElement | null
-    if (currentEl) currentEl.scrollIntoView({ block: 'center' })
-  }, [currentSubtitle?.id])
 
   // playback controls below video (requirement 2)
   const togglePlay = () => {
@@ -305,7 +329,7 @@ export default function App(){
 
   // zoom buttons
   const zoomOut = ()=> setZoom(z => Math.max(0.25, +(z-0.25).toFixed(2)))
-  const zoomIn = ()=> setZoom(z => Math.min(5, +(z+0.25).toFixed(2)))
+  const zoomIn = ()=> setZoom(z => Math.min(10, +(z+0.25).toFixed(2)))
 
   // keyboard
   useEffect(()=>{
@@ -323,6 +347,20 @@ export default function App(){
   // timeline dims
   const pxPerSec = 80 * zoom
   const timelineWidth = Math.max(600, Math.ceil((duration||120) * pxPerSec))
+  
+  // Calculate optimal time division based on zoom level
+  const timeDivision = useMemo(() => {
+    if (zoom >= 8) return 1/60 // ~frame-level at 60fps
+    if (zoom >= 6) return 1/30 // frame-level at 30fps
+    if (zoom >= 4) return 0.1  // 100ms
+    if (zoom >= 2) return 0.5  // 500ms
+    if (zoom >= 1) return 1    // 1s
+    if (zoom >= 0.5) return 2  // 2s
+    return 5                   // 5s
+  }, [zoom])
+
+  const trackCount = speakers.length>0 ? speakers.length : 10
+  const timelineMinHeight = 24 + trackCount * 28
 
   // click timeline seek
   const waveRef = useRef<HTMLDivElement>(null)
@@ -514,7 +552,7 @@ export default function App(){
         <div className="center" ref={centerRef}>
           {/* Video area */}
           <div className="section" style={{paddingBottom: 0}}>
-            <div className="video-wrap" style={{height: videoAreaHeight}}>
+            <div style={{height: videoAreaHeight}}>
               {media?.type === 'video' ? (
                 <video ref={videoRef} src={media.url} onTimeUpdate={onTimeUpdate} onLoadedMetadata={onLoadedMetadata}
                   style={{width:'100%', height:'100%', objectFit:'contain'}} onClick={togglePlay} controls={false} />
@@ -532,54 +570,80 @@ export default function App(){
             <button className="btn icon" title="Next segment" onClick={jumpNext}><SkipForward size={16}/></button>
             <div className="space" />
             <button className="btn icon" title="Zoom Out" onClick={zoomOut}><ZoomOut size={16}/></button>
-            <input type="range" min={0.25} max={5} step={0.05} value={zoom} onChange={e=>setZoom(+e.target.value)} />
+            <input type="range" min={0.25} max={10} step={0.05} value={zoom} onChange={e=>setZoom(+e.target.value)} />
             <button className="btn icon" title="Zoom In" onClick={zoomIn}><ZoomIn size={16}/></button>
             <div style={{width:64, textAlign:'right'}} className="badge-sm">{zoom.toFixed(2)}x</div>
           </div>
 
-          {/* Timeline area fills to bottom */}
-          <div className="timeline-wrap" style={{flex: 1, minHeight: 0}}>
-            <div className="timeline" ref={waveRef} onClick={onClickTimeline}
+          {/* Timeline area with fixed default height to avoid large empty space */}
+          <div className="timeline-wrap" style={{height: timelineMinHeight, flex: '0 0 auto', display:'flex', flexDirection:'column', justifyContent:'flex-end', padding: '0 12px'}}>
+            <div className="timeline" style={{height: timelineMinHeight}} ref={waveRef} onClick={onClickTimeline}
               onPointerDown={onTimelinePointerDown}
               onPointerMove={onTimelinePointerMove}
               onPointerUp={onTimelinePointerUp}
             >
               {/* RULER */}
               <div className="ruler" style={{width: timelineWidth}}>
-                {Array.from({length: Math.ceil((duration||0)/1)+1}).map((_,i)=>{
-                  const left = i * pxPerSec
+                {Array.from({length: Math.ceil((duration||0)/timeDivision)+1}).map((_,i)=>{
+                  const left = i * timeDivision * pxPerSec
                   const major = i % 5 === 0
                   return (
-                    <div key={i}>
-                      <div className="tick" style={{left, height: major? '100%':'40%', opacity: major?1:0.4}}></div>
-                      {major && <div className="label" style={{left}}>{formatTime(i)}</div>}
+                    <div key={`major-${i}`}>
+                      <div className="tick" style={{left, height: '100%', opacity: 1}}></div>
+                      {major && <div className="label" style={{left}}>{formatTime(i * timeDivision)}</div>}
                     </div>
                   )
                 })}
+                {(()=>{
+                  const minorDiv = timeDivision/5
+                  if (minorDiv <= 0) return null
+                  const arr = Array.from({length: Math.ceil((duration||0)/minorDiv)+1})
+                  return arr.map((_,i)=>{
+                    const left = i * minorDiv * pxPerSec
+                    const isMajorAligned = Math.abs((i*minorDiv) % timeDivision) < 1e-6
+                    if (isMajorAligned) return null
+                    return (
+                      <div key={`minor-${i}`} className="tick" style={{left, height: '40%', opacity: 0.4}}></div>
+                    )
+                  })
+                })()}
               </div>
 
               {/* Tracks container fills remaining height */}
               <div className="tracks" style={{width: timelineWidth}}>
                 <div className="playhead-long" style={{left: `${currentTime * pxPerSec}px`}}/>
                 {/* SPEAKER TRACKS (vertically scrollable) */}
-                {speakers.map(spk=>{
-                  const hidden = !spk.visible
+                {allTracks.map(spk=>{
+                  const hidden = speakers.length > 0 ? !spk.visible : false
                   return (
                     <div key={spk.id} className="track" style={{width: timelineWidth, opacity: hidden?0.3:1}}>
-                      {segments.filter(s=>s.speakerId===spk.id).map(seg=>{
-                        const left = seg.start * pxPerSec
-                        const w = (seg.end - seg.start) * pxPerSec
-                        const isActive = currentTime >= seg.start && currentTime < seg.end
-                        return (
-                          <div key={seg.id} className={`seg${isActive? ' active':''}`} style={{left, width:w, background: spk.color}}
-                            onMouseEnter={(e)=>{
-                              setTooltip({x: e.clientX, y: e.clientY-30, text: `${spk.name}  ${formatTime(seg.start)}–${formatTime(seg.end)} (${formatTime(seg.end-seg.start)})`})
-                            }}
-                            onMouseLeave={()=>setTooltip(null)}
-                            onClick={(e)=>{ e.stopPropagation(); seek(seg.start) }}
-                          />
-                        )
-                      })}
+                      {speakers.length > 0 ? 
+                        segments.filter(s=>s.speakerId===spk.id).map(seg=>{
+                          const left = seg.start * pxPerSec
+                          const w = (seg.end - seg.start) * pxPerSec
+                          const isActive = currentTime >= seg.start && currentTime < seg.end
+                          return (
+                            <div key={seg.id} className={`seg${isActive? ' active':''}`} style={{left, width:w, background: spk.color}}
+                              onMouseEnter={(e)=>{
+                                setTooltip({x: e.clientX, y: e.clientY-30, text: `${spk.name}  ${formatTime(seg.start)}–${formatTime(seg.end)} (${formatTime(seg.end-seg.start)})`})
+                              }}
+                              onMouseLeave={()=>setTooltip(null)}
+                              onClick={(e)=>{ e.stopPropagation(); seek(seg.start) }}
+                            />
+                          )
+                        }) : 
+                        // Show empty track when no RTTM
+                        <div style={{
+                          position: 'absolute',
+                          left: '10px',
+                          top: '50%',
+                          transform: 'translateY(-50%)',
+                          color: '#6B7280',
+                          fontSize: '12px'
+                        }}>
+                          Empty track
+                        </div>
+                      }
                     </div>
                   )
                 })}
