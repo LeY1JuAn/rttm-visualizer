@@ -26,6 +26,8 @@ body {
 }
 .logo { display:flex; align-items:center; gap:8px; }
 .badge { width:32px; height:32px; background: var(--accent); border-radius: 8px; display:flex; align-items:center; justify-content:center; font-weight: 800; }
+.badge.github { background: #0D1117; color: #e5e7eb; border:1px solid var(--border); transition: transform .18s ease, box-shadow .18s ease, background .18s ease; }
+.badge.github:hover { transform: translateY(-1px) scale(1.05) rotate(-2deg); box-shadow: 0 6px 20px rgba(0,0,0,0.35); background: #111826; }
 .title { font-weight: 700; font-size: 16px; }
 
 .layout { display:flex; height: calc(100vh - 57px); }

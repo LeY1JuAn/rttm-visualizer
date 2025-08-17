@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Eye, EyeOff, FileAudio, FileVideo, FileText, Download } from 'lucide-react'
+import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Eye, EyeOff, FileAudio, FileVideo, FileText, Download, Subtitles, Github } from 'lucide-react'
 
 type MediaType = 'audio' | 'video'
 
@@ -17,6 +17,20 @@ interface RTTMFile {
   name: string
   url: string
   matched: boolean
+}
+
+interface SRTFile {
+  id: string
+  name: string
+  url: string
+  subtitles: Subtitle[]
+}
+
+interface Subtitle {
+  id: number
+  start: number
+  end: number
+  text: string
 }
 
 interface Segment {
@@ -37,6 +51,31 @@ function formatTime(sec:number){
   const m = Math.floor(sec/60)
   const s = Math.floor(sec%60).toString().padStart(2,'0')
   return `${m}:${s}`
+}
+
+function parseSRT(text: string): Subtitle[] {
+  const subtitles: Subtitle[] = []
+  const blocks = text.trim().split(/\r?\n\r?\n/)
+  
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/)
+    if (lines.length < 3) continue
+    
+    const id = parseInt(lines[0])
+    if (isNaN(id)) continue
+    
+    const timeMatch = lines[1].match(/(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})/)
+    if (!timeMatch) continue
+    
+    const start = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseInt(timeMatch[3]) + parseInt(timeMatch[4]) / 1000
+    const end = parseInt(timeMatch[5]) * 3600 + parseInt(timeMatch[6]) * 60 + parseInt(timeMatch[7]) + parseInt(timeMatch[8]) / 1000
+    
+    const text = lines.slice(2).join('\n').trim()
+    
+    subtitles.push({ id, start, end, text })
+  }
+  
+  return subtitles.sort((a, b) => a.start - b.start)
 }
 
 function parseRTTM(text:string): {segments:Segment[], speakers:Speaker[]} {
@@ -83,6 +122,7 @@ export default function App(){
   const [zoom, setZoom] = useState(1)
   const [media, setMedia] = useState<MediaFile|null>({ id:'sample', name:'sample.mp4', type:'video', url: sampleVideo })
   const [rttm, setRTTM] = useState<RTTMFile|null>(null)
+  const [srt, setSRT] = useState<SRTFile|null>(null)
   const [segments, setSegments] = useState<Segment[]>([])
   const [speakers, setSpeakers] = useState<Speaker[]>([])
   const [leftCollapsed, setLeftCollapsed] = useState(false)
@@ -93,9 +133,12 @@ export default function App(){
   const isScrubbingRef = useRef(false)
   const defaultLoadedRef = useRef(false)
 
-  // drag-n-drop upload
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  // drag-n-drop upload (global)
   const [dragOver, setDragOver] = useState(false)
+  // per-section upload inputs
+  const mediaInputRef = useRef<HTMLInputElement>(null)
+  const rttmInputRef = useRef<HTMLInputElement>(null)
+  const srtInputRef = useRef<HTMLInputElement>(null)
   const onDrop = useCallback((e: React.DragEvent)=>{
     e.preventDefault(); setDragOver(false)
     const files = Array.from(e.dataTransfer.files)
@@ -112,6 +155,14 @@ export default function App(){
           setRTTM({ id: crypto.randomUUID(), name:f.name, url, matched: true })
         }
         reader.readAsText(f)
+      } else if(f.name.toLowerCase().endsWith('.srt')){
+        const url = URL.createObjectURL(f)
+        const reader = new FileReader()
+        reader.onload = () => {
+          const subtitles = parseSRT(String(reader.result))
+          setSRT({ id: crypto.randomUUID(), name: f.name, url, subtitles })
+        }
+        reader.readAsText(f)
       } else if(/\.(mp4|webm|mp3|wav|m4a)$/i.test(f.name)){
         const url = URL.createObjectURL(f)
         const type: MediaType = /\.(mp4|webm)$/i.test(f.name) ? 'video' : 'audio'
@@ -119,6 +170,58 @@ export default function App(){
       }
     }
   }
+
+  // Get current subtitle based on current time
+  const currentSubtitle = useMemo(() => {
+    if (!srt?.subtitles) return null
+    return srt.subtitles.find(sub => currentTime >= sub.start && currentTime < sub.end) || null
+  }, [srt, currentTime])
+
+  // Get next subtitle for preview
+  const nextSubtitle = useMemo(() => {
+    if (!srt?.subtitles) return null
+    return srt.subtitles.find(sub => sub.start > currentTime) || null
+  }, [srt, currentTime])
+
+  // Index of current subtitle and a window around it
+  const currentSubtitleIndex = useMemo(() => {
+    if (!srt?.subtitles) return -1
+    const list = srt.subtitles
+    for (let i = 0; i < list.length; i++) {
+      const sub = list[i]
+      if (currentTime >= sub.start && currentTime < sub.end) return i
+      if (currentTime < sub.start) return i - 1
+    }
+    return list.length - 1
+  }, [srt, currentTime])
+
+  const allSubtitles = useMemo(() => {
+    return srt?.subtitles ?? []
+  }, [srt])
+
+  // search query for subtitles
+  const [subtitleQuery, setSubtitleQuery] = useState('')
+  const visibleSubtitles = useMemo(() => {
+    const q = subtitleQuery.trim().toLowerCase()
+    if (!q) return allSubtitles
+    return allSubtitles.filter(s => s.text.toLowerCase().includes(q))
+  }, [allSubtitles, subtitleQuery])
+
+  // right panel auto collapse/expand logic based on data presence
+  const hasRTTM = useMemo(()=> !!rttm && speakers.length>0, [rttm, speakers])
+  const hasSRT = useMemo(()=> !!srt, [srt])
+  useEffect(()=>{
+    if(!hasRTTM && !hasSRT) setRightCollapsed(true)
+    else setRightCollapsed(false)
+  }, [hasRTTM, hasSRT])
+
+  const aroundListRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = aroundListRef.current
+    if (!el) return
+    const currentEl = el.querySelector('.sub-item.current') as HTMLElement | null
+    if (currentEl) currentEl.scrollIntoView({ block: 'center' })
+  }, [currentSubtitle?.id])
 
   // playback controls below video (requirement 2)
   const togglePlay = () => {
@@ -318,7 +421,16 @@ export default function App(){
       {/* App Bar */}
       <div className="appbar">
         <div className="logo">
-          <div className="badge">RV</div>
+          <a
+            className="badge github"
+            href="https://github.com/DURUII/rttm-visualizer"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Open GitHub repository"
+            title="GitHub"
+          >
+            <Github size={18} />
+          </a>
           <div className="title">{title}</div>
         </div>
         <div className="row">
@@ -335,20 +447,16 @@ export default function App(){
           onDragLeave={()=>setDragOver(false)}
           onDrop={onDrop}
         >
-          {!leftCollapsed && (
-            <div className={ 'uploader' + (dragOver? ' drag':'' ) } onClick={()=>fileInputRef.current?.click()}>
-              <Upload className="file-icon" />
-              <div>Drag & Drop media (.mp4/.webm/.mp3/.wav) and .rttm here<br/>or click to browse</div>
-              <input ref={fileInputRef} type="file" multiple style={{display:'none'}}
-                accept=".mp4,.webm,.mp3,.wav,.m4a,.rttm"
-                onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))}
-              />
-            </div>
-          )}
+          {!leftCollapsed && null}
 
           <div className="section">
             <div className="card">
-              <div style={{fontWeight:700, marginBottom:8}}>Media</div>
+              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                <div style={{fontWeight:700}}>Media</div>
+                <button className="btn" onClick={()=> mediaInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
+                <input ref={mediaInputRef} type="file" style={{display:'none'}} accept=".mp4,.webm,.mp3,.wav,.m4a"
+                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))} />
+              </div>
               {media ? (
                 <div className="file-list-item">
                   {media.type==='video' ? <FileVideo className="file-icon"/> : <FileAudio className="file-icon"/>}
@@ -363,7 +471,12 @@ export default function App(){
 
           <div className="section">
             <div className="card">
-              <div style={{fontWeight:700, marginBottom:8}}>RTTM</div>
+              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                <div style={{fontWeight:700}}>RTTM</div>
+                <button className="btn" onClick={()=> rttmInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
+                <input ref={rttmInputRef} type="file" style={{display:'none'}} accept=".rttm"
+                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))} />
+              </div>
               {rttm ? (
                 <div className="file-list-item">
                   <FileText className="file-icon"/>
@@ -373,6 +486,26 @@ export default function App(){
                   </div>
                 </div>
               ) : <div className="badge-sm">Drop an .rttm file</div>}
+            </div>
+          </div>
+
+          <div className="section">
+            <div className="card">
+              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                <div style={{fontWeight:700}}>SRT</div>
+                <button className="btn" onClick={()=> srtInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
+                <input ref={srtInputRef} type="file" style={{display:'none'}} accept=".srt"
+                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))} />
+              </div>
+              {srt ? (
+                <div className="file-list-item">
+                  <Subtitles className="file-icon"/>
+                  <div style={{overflow:'hidden'}}>
+                    <div style={{fontSize:14, whiteSpace:'nowrap', textOverflow:'ellipsis', overflow:'hidden'}}>{srt.name}</div>
+                    <div className="badge-sm">Subtitles: {srt.subtitles.length}</div>
+                  </div>
+                </div>
+              ) : <div className="badge-sm">Drop an .srt file</div>}
             </div>
           </div>
         </div>
@@ -460,23 +593,82 @@ export default function App(){
           </div>
         </div>
 
-        {/* Right panel: legend (collapsible) */}
+        {/* Right panel: legend and subtitles (collapsible) */}
         <div className={"panel right section" + (rightCollapsed ? ' collapsed' : '')}>
           {!rightCollapsed && (
-            <div className="card">
-              <div style={{fontWeight:700, marginBottom:8}}>Speakers</div>
-              <div className="grid" >
-                {speakers.length===0 && <div className="badge-sm">No RTTM loaded</div>}
-                {speakers.map(spk=> (
-                  <div key={spk.id} className={'legend-item ' + (spk.visible? '' : 'hidden')}>
-                    <div className="color-dot" style={{background: spk.color}}/>
-                    <div style={{flex:1}}>{spk.name}</div>
-                    <button className="btn icon" onClick={()=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, visible: !s.visible}: s))}>
-                      {spk.visible ? <Eye size={14}/> : <EyeOff size={14}/>}
-                    </button>
+            <div style={{display:'grid', gridTemplateRows: (hasRTTM && hasSRT) ? '4fr 6fr' : '1fr', gap:16, height:'100%'}}>
+              {hasRTTM && (
+                <div className="card fade-in" style={{minHeight:0, overflow:'auto'}}>
+                  <div style={{fontWeight:700, marginBottom:8}}>Speakers</div>
+                  <div className="grid" >
+                    {speakers.length===0 && <div className="badge-sm">No RTTM loaded</div>}
+                    {speakers.map(spk=> (
+                      <div key={spk.id} className={'legend-item ' + (spk.visible? '' : 'hidden')}>
+                        <div className="color-dot" style={{background: spk.color}}/>
+                        <div style={{flex:1}}>{spk.name}</div>
+                        <button className="btn icon" onClick={()=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, visible: !s.visible}: s))}>
+                          {spk.visible ? <Eye size={14}/> : <EyeOff size={14}/>}
+                        </button>
+                      </div>
+                    ))}
                   </div>
-                ))}
+                </div>
+              )}
+
+              {/* Subtitles Preview */}
+              {hasSRT && (
+              <div className="card fade-in" style={{minHeight:0, display:'flex', flexDirection:'column'}}>
+                <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                  <div style={{fontWeight:700}}>Subtitles</div>
+                  {srt && (
+                    <input
+                      value={subtitleQuery}
+                      onChange={e=>setSubtitleQuery(e.target.value)}
+                      placeholder="Search subtitles..."
+                      style={{
+                        flex:1,
+                        marginLeft:8,
+                        background:'#0f141b',
+                        border:'1px solid var(--border)',
+                        color:'var(--text)',
+                        borderRadius:8,
+                        padding:'6px 8px',
+                        minWidth:0
+                      }}
+                    />
+                  )}
+                </div>
+                {!srt ? (
+                  <div className="badge-sm">No .srt loaded</div>
+                ) : (
+                  <div ref={aroundListRef} style={{flex:1, minHeight:0, overflow:'auto', display:'grid', gap:10}}>
+                    {visibleSubtitles.map((sub) => {
+                      const isCurrent = currentSubtitle?.id === sub.id
+                      return (
+                        <div key={sub.id} className={`sub-item${isCurrent ? ' current' : ''}`} style={{
+                          background: isCurrent ? '#1F2937' : '#111827',
+                          padding: '10px 12px',
+                          borderRadius: 8,
+                          border: '1px solid var(--border)',
+                          opacity: isCurrent ? 1 : 0.85,
+                          cursor: 'pointer'
+                        }} onClick={()=>seek(sub.start)} title={`${formatTime(sub.start)} - ${formatTime(sub.end)}`}>
+                          <div style={{fontSize: 12, color: '#9aa4b2', marginBottom: 6}}>
+                            {formatTime(sub.start)} - {formatTime(sub.end)}
+                          </div>
+                          <div style={{whiteSpace:'pre-wrap', fontSize: 14, lineHeight: 1.4}}>{sub.text}</div>
+                        </div>
+                      )
+                    })}
+                    {visibleSubtitles.length === 0 && (
+                      <div style={{color: '#6B7280', fontSize: 14, textAlign: 'center', padding: '20px 0'}}>
+                        No subtitles
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
+              )}
             </div>
           )}
         </div>
