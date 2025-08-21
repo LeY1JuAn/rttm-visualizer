@@ -98,8 +98,26 @@ body {
 .playhead-long { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--danger); pointer-events: none; z-index: 2; }
 
 .track { position: relative; height: 28px; background:#121624; border-top:1px solid #20263a; }
-.seg { position:absolute; top:3px; bottom:3px; border-radius: 4px; opacity: 0.9; }
+.seg { position:absolute; top:3px; bottom:3px; border-radius: 4px; opacity: 0.9; transition: box-shadow .1s ease; }
 .seg.active { outline: 2px solid rgba(255,255,255,0.9); box-shadow: 0 0 0 2px rgba(239,68,68,0.5) inset; }
+.seg.selected { box-shadow: 0 0 0 2px rgba(255,255,255,0.5) inset; }
+.seg .handle { position:absolute; top:-2px; bottom:-2px; width:6px; background: rgba(255,255,255,0.2); opacity:0; transition: opacity .12s ease; cursor: ew-resize; }
+.seg .handle.left { left:-3px; border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
+.seg .handle.right { right:-3px; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+.seg:hover .handle { opacity:1; }
+
+/* Context menu */
+.context-menu { position: fixed; z-index: 1000; background:#0f141b; border:1px solid var(--border); border-radius:8px; box-shadow: 0 8px 30px rgba(0,0,0,0.4); padding:4px; }
+.context-menu .menu-item { display:block; width:100%; text-align:left; padding:8px 12px; background:transparent; border:none; color:var(--text); cursor:pointer; }
+.context-menu .menu-item:hover { background:#111827; }
+
+/* Modal */
+.modal-backdrop { position: fixed; inset:0; background: rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; z-index: 1000; }
+.modal { width: 360px; background: #0f141b; border:1px solid var(--border); border-radius:12px; padding:16px; }
+
+/* Toast */
+.toast { position: fixed; left:50%; transform: translateX(-50%); bottom: 20px; background:#0f141b; border:1px solid var(--border); padding:8px 12px; border-radius:8px; display:flex; align-items:center; gap:8px; z-index: 1000; }
+.toast .link { background: transparent; border:none; color: var(--accent); cursor: pointer; }
 
 .legend-item { display:flex; align-items:center; gap:8px; padding:8px; border:1px solid var(--border); border-radius:8px; }
 .color-dot { width:14px; height:14px; border-radius:4px; }

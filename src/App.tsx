@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Eye, EyeOff, FileAudio, FileVideo, FileText, Download, Subtitles, Github } from 'lucide-react'
+import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Eye, EyeOff, FileAudio, FileVideo, FileText, Download, Subtitles, Github, Plus, Trash2 } from 'lucide-react'
 
 type MediaType = 'audio' | 'video'
 
@@ -51,6 +51,16 @@ function formatTime(sec:number){
   const m = Math.floor(sec/60)
   const s = Math.floor(sec%60).toString().padStart(2,'0')
   return `${m}:${s}`
+}
+
+function formatHMSms(seconds: number){
+  const sign = seconds < 0 ? '-' : ''
+  const t = Math.abs(seconds)
+  const hours = Math.floor(t/3600)
+  const minutes = Math.floor((t%3600)/60)
+  const secs = Math.floor(t%60)
+  const ms = Math.round((t - Math.floor(t)) * 1000)
+  return `${sign}${hours.toString().padStart(2,'0')}:${minutes.toString().padStart(2,'0')}:${secs.toString().padStart(2,'0')}.${ms.toString().padStart(3,'0')}`
 }
 
 function parseSRT(text: string): Subtitle[] {
@@ -109,9 +119,9 @@ function parseRTTM(text:string): {segments:Segment[], speakers:Speaker[]} {
 const sampleVideo = "https://videos.pexels.com/video-files/30333849/13003128_2560_1440_25fps.mp4"
 
 // Load local defaults from exp/ using Vite glob imports
-// RTTM as raw text; media as URLs (new options: query/import)
-const defaultRttmFiles = import.meta.glob('/exp/rttm/*.rttm', { eager: true, query: '?raw', import: 'default' }) as Record<string, string>
-const defaultMediaFiles = import.meta.glob('/exp/raw/*.{mp4,webm,mp3,wav,m4a}', { eager: true, query: '?url', import: 'default' }) as Record<string, string>
+// RTTM as raw text; media as URLs
+const defaultRttmFiles = import.meta.glob('/exp/rttm/*.rttm', { eager: true, as: 'raw' }) as Record<string, string>
+const defaultMediaFiles = import.meta.glob('/exp/raw/*.{mp4,webm,mp3,wav,m4a}', { eager: true, as: 'url' }) as Record<string, string>
 
 export default function App(){
   const [title] = useState('RTTM Visualizer') // 1) Title updated
@@ -132,6 +142,28 @@ export default function App(){
   const resizeStateRef = useRef<{startY:number; startH:number} | null>(null)
   const isScrubbingRef = useRef(false)
   const defaultLoadedRef = useRef(false)
+  const [selectedSegId, setSelectedSegId] = useState<string|null>(null)
+  const dragRef = useRef<{ type: 'start'|'end'|'move'|'create'; speakerId: string; segId?: string; anchorTime?: number } | null>(null)
+  const [dragTip, setDragTip] = useState<{x:number;y:number;text:string}|null>(null)
+  const segmentsRef = useRef<Segment[]>([])
+  useEffect(()=>{ segmentsRef.current = segments }, [segments])
+  const [ctxMenu, setCtxMenu] = useState<{x:number; y:number; segId: string} | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<{open: boolean; segId: string} | null>(null)
+  const lastDeletedRef = useRef<Segment | null>(null)
+  const [toast, setToast] = useState<{message: string; actionLabel?: string; onAction?: ()=>void} | null>(null)
+
+  useEffect(()=>{
+    const closeMenu = () => setCtxMenu(null)
+    const onKey = (e: KeyboardEvent) => { if(e.key==='Escape'){ setCtxMenu(null); setConfirmDelete(null) } }
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('scroll', closeMenu, true)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('scroll', closeMenu, true)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [])
 
   // drag-n-drop upload (global)
   const [dragOver, setDragOver] = useState(false)
@@ -240,7 +272,7 @@ export default function App(){
   }, [allSubtitles, subtitleQuery])
 
   // right panel auto collapse/expand logic based on data presence
-  const hasRTTM = useMemo(()=> !!rttm && speakers.length>0, [rttm, speakers])
+  const hasRTTM = useMemo(()=> (!!rttm) || speakers.length>0, [rttm, speakers.length])
   const hasSRT = useMemo(()=> !!srt, [srt])
   useEffect(()=>{
     if(!hasRTTM && !hasSRT) setRightCollapsed(true)
@@ -395,6 +427,87 @@ export default function App(){
     try { (e.target as Element).releasePointerCapture?.(e.pointerId) } catch {}
   }
 
+  // Helpers for drag/creation logic
+  const MIN_DUR = 0.01 // 10ms
+  const toTimeFromClientX = (clientX: number) => {
+    const el = waveRef.current; if(!el) return 0
+    const rect = el.getBoundingClientRect()
+    const x = clientX - rect.left + el.scrollLeft
+    return Math.max(0, Math.min((duration||0), x / pxPerSec))
+  }
+
+  const getSpeakerNeighborBounds = (speakerId: string, segId?: string) => {
+    const list = segments.filter(s=>s.speakerId===speakerId).sort((a,b)=>a.start-b.start)
+    let prevEnd = 0
+    let nextStart = duration || Number.POSITIVE_INFINITY
+    for(let i=0;i<list.length;i++){
+      const s = list[i]
+      if(segId && s.id===segId){
+        if(i>0) prevEnd = list[i-1].end
+        if(i<list.length-1) nextStart = list[i+1].start
+        break
+      }
+    }
+    if(!segId && list.length>0){
+      // For creation we just use full bounds (no overlap across existing segments)
+      // We will clamp later against nearest neighbors based on the new time
+    }
+    return {prevEnd, nextStart}
+  }
+
+  const updateSegmentTime = (segId: string, nextStart: number, nextEnd: number) => {
+    setSegments(prev => {
+      const target = prev.find(s=>s.id===segId)
+      if(!target) return prev
+      const {prevEnd, nextStart: ns} = getSpeakerNeighborBounds(target.speakerId, segId)
+      const clampedStart = Math.max(prevEnd, Math.min(nextStart, ns - MIN_DUR))
+      const clampedEnd = Math.max(clampedStart + MIN_DUR, Math.min(nextEnd, ns))
+      return prev.map(s=> s.id===segId? {...s, start: clampedStart, end: clampedEnd}: s)
+    })
+  }
+
+  const createSegmentAt = (speakerId: string, atTime: number) => {
+    const id = crypto.randomUUID()
+    const baseStart = atTime
+    const baseEnd = Math.min((duration||atTime+1), atTime + 0.2)
+    const newSeg: Segment = { id, speakerId, start: baseStart, end: baseEnd }
+    setSegments(prev => {
+      // Prevent overlap on insert by shrinking into nearest gap
+      const list = prev.filter(s=>s.speakerId===speakerId).sort((a,b)=>a.start-b.start)
+      let leftBound = 0
+      let rightBound = duration || Number.POSITIVE_INFINITY
+      for(let i=0;i<list.length;i++){
+        const s = list[i]
+        if(s.end <= atTime){ leftBound = Math.max(leftBound, s.end) }
+        if(s.start >= atTime && rightBound=== (duration||Number.POSITIVE_INFINITY)){ rightBound = s.start }
+      }
+      const start = Math.max(leftBound, Math.min(baseStart, rightBound - MIN_DUR))
+      const end = Math.max(start + MIN_DUR, Math.min(baseEnd, rightBound))
+      const adjusted = {...newSeg, start, end}
+      return [...prev, adjusted].sort((a,b)=> a.start-b.start)
+    })
+    setSelectedSegId(id)
+    return id
+  }
+
+  // Remove segment with optional undo
+  const removeTimeSegment = (segId: string) => {
+    const seg = segmentsRef.current.find(s=>s.id===segId) || null
+    if(!seg) return
+    lastDeletedRef.current = seg
+    setSegments(prev => prev.filter(s=> s.id!==segId))
+    setSelectedSegId(v => v===segId ? null : v)
+    const undo = () => {
+      const snap = lastDeletedRef.current
+      if(!snap) return
+      setSegments(prev => [...prev, snap].sort((a,b)=> a.start-b.start))
+      lastDeletedRef.current = null
+      setToast(null)
+    }
+    setToast({ message: '已删除一个时间段', actionLabel: '撤销', onAction: undo })
+    window.setTimeout(()=>{ setToast(null) }, 5000)
+  }
+
   // auto-scroll timeline to keep playhead in view (throttled, no repeated smooth to avoid jitter)
   const autoScrollStateRef = useRef<{ lastTs: number; lastLeft: number }>({ lastTs: 0, lastLeft: 0 })
   useEffect(()=>{
@@ -454,6 +567,24 @@ export default function App(){
     URL.revokeObjectURL(url)
   }
 
+  const exportRTTM = () => {
+    const fileId = media?.name ? media.name.replace(/\.[^/.]+$/, '') : 'unknown'
+    const lines = segments
+      .slice()
+      .sort((a,b)=> a.start-b.start)
+      .map(seg => {
+        const dur = Math.max(MIN_DUR, seg.end - seg.start)
+        // SPEAKER <file_id> <chnl> <tbeg> <tdur> <ortho> <stype> <name> <conf>
+        return `SPEAKER ${fileId} 1 ${seg.start.toFixed(3)} ${dur.toFixed(3)} <NA> <NA> ${seg.speakerId} <NA>`
+      })
+      .join('\n')
+    const blob = new Blob([lines+'\n'], {type:'text/plain'})
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = `${fileId || 'segments'}.rttm`; a.click()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <div style={{display:'flex', flexDirection:'column', height:'100%'}}>
       {/* App Bar */}
@@ -472,7 +603,8 @@ export default function App(){
           <div className="title">{title}</div>
         </div>
         <div className="row">
-          <button className="btn" onClick={exportJSON}><Download className="file-icon" />Export</button>
+          <button className="btn" onClick={exportRTTM}><Download className="file-icon" />导出RTTM</button>
+          <button className="btn" onClick={exportJSON}><Download className="file-icon" />导出工程JSON</button>
           <button className="btn" onClick={()=> setLeftCollapsed(v=>!v)}>{leftCollapsed? 'Show Left' : 'Hide Left'}</button>
           <button className="btn" onClick={()=> setRightCollapsed(v=>!v)}>{rightCollapsed? 'Show Right' : 'Hide Right'}</button>
         </div>
@@ -590,7 +722,7 @@ export default function App(){
                   return (
                     <div key={`major-${i}`}>
                       <div className="tick" style={{left, height: '100%', opacity: 1}}></div>
-                      {major && <div className="label" style={{left}}>{formatTime(i * timeDivision)}</div>}
+                      {major && <div className="label" style={{left}}>{formatHMSms(i * timeDivision)}</div>}
                     </div>
                   )
                 })}
@@ -616,20 +748,88 @@ export default function App(){
                 {allTracks.map(spk=>{
                   const hidden = speakers.length > 0 ? !spk.visible : false
                   return (
-                    <div key={spk.id} className="track" style={{width: timelineWidth, opacity: hidden?0.3:1}}>
+                    <div key={spk.id} className="track" style={{width: timelineWidth, opacity: hidden?0.3:1}}
+                      onPointerDown={(e)=>{
+                        // create new seg in empty area
+                        if((e.target as HTMLElement).closest('.seg')) return
+                        e.stopPropagation()
+                        if(speakers.length===0) return
+                        const t = toTimeFromClientX(e.clientX)
+                        const newId = createSegmentAt(spk.id, t)
+                        dragRef.current = { type: 'create', speakerId: spk.id, segId: newId, anchorTime: t }
+                        setDragTip({x: e.clientX, y: e.clientY-28, text: `${spk.name}  ${formatHMSms(t)}`})
+                        const onMove = (ev: PointerEvent) => {
+                          const time = toTimeFromClientX(ev.clientX)
+                          setDragTip({x: ev.clientX, y: ev.clientY-28, text: `${spk.name}  ${formatHMSms(Math.min(time, t))} – ${formatHMSms(Math.max(time, t))}`})
+                          setSegments(prev => prev.map(s=> s.id===newId ? ({...s, start: Math.min(time, t), end: Math.max(time, t)}) : s))
+                        }
+                        const onUp = () => {
+                          const state = dragRef.current; if(!state) return
+                          const segId = state.segId!
+                          const finalSeg = segmentsRef.current.find(s=>s.id===segId)
+                          const cur = finalSeg || null
+                          if(cur){ updateSegmentTime(segId, cur.start, cur.end) }
+                          dragRef.current = null
+                          setDragTip(null)
+                          window.removeEventListener('pointermove', onMove)
+                          window.removeEventListener('pointerup', onUp)
+                        }
+                        window.addEventListener('pointermove', onMove)
+                        window.addEventListener('pointerup', onUp)
+                      }}
+                    >
                       {speakers.length > 0 ? 
                         segments.filter(s=>s.speakerId===spk.id).map(seg=>{
                           const left = seg.start * pxPerSec
                           const w = (seg.end - seg.start) * pxPerSec
                           const isActive = currentTime >= seg.start && currentTime < seg.end
                           return (
-                            <div key={seg.id} className={`seg${isActive? ' active':''}`} style={{left, width:w, background: spk.color}}
+                            <div key={seg.id} className={`seg${isActive? ' active':''}${selectedSegId===seg.id?' selected':''}`}
+                              style={{left, width:w, background: spk.color}}
                               onMouseEnter={(e)=>{
-                                setTooltip({x: e.clientX, y: e.clientY-30, text: `${spk.name}  ${formatTime(seg.start)}–${formatTime(seg.end)} (${formatTime(seg.end-seg.start)})`})
+                                setTooltip({x: e.clientX, y: e.clientY-30, text: `${spk.name}  ${formatHMSms(seg.start)}–${formatHMSms(seg.end)} (${formatHMSms(seg.end-seg.start)})`})
                               }}
                               onMouseLeave={()=>setTooltip(null)}
-                              onClick={(e)=>{ e.stopPropagation(); seek(seg.start) }}
-                            />
+                              onClick={(e)=>{ e.stopPropagation(); setSelectedSegId(seg.id); seek(seg.start) }}
+                              onContextMenu={(e)=>{ e.preventDefault(); e.stopPropagation(); setSelectedSegId(seg.id); setCtxMenu({x: e.clientX, y: e.clientY, segId: seg.id}) }}
+                            >
+                              <div className="handle left" onPointerDown={(e)=>{
+                                e.stopPropagation()
+                                dragRef.current = { type: 'start', speakerId: spk.id, segId: seg.id }
+                                try { (e.target as Element).setPointerCapture?.(e.pointerId) } catch {}
+                                const onMove = (ev: PointerEvent) => {
+                                  const t = toTimeFromClientX(ev.clientX)
+                                  setDragTip({x: ev.clientX, y: ev.clientY-28, text: `${formatHMSms(t)} →`})
+                                  updateSegmentTime(seg.id, Math.min(t, seg.end - MIN_DUR), seg.end)
+                                }
+                                const onUp = (ev: PointerEvent) => {
+                                  try { (e.target as Element).releasePointerCapture?.((ev as any).pointerId) } catch {}
+                                  dragRef.current = null; setDragTip(null)
+                                  window.removeEventListener('pointermove', onMove)
+                                  window.removeEventListener('pointerup', onUp)
+                                }
+                                window.addEventListener('pointermove', onMove)
+                                window.addEventListener('pointerup', onUp)
+                              }} />
+                              <div className="handle right" onPointerDown={(e)=>{
+                                e.stopPropagation()
+                                dragRef.current = { type: 'end', speakerId: spk.id, segId: seg.id }
+                                try { (e.target as Element).setPointerCapture?.(e.pointerId) } catch {}
+                                const onMove = (ev: PointerEvent) => {
+                                  const t = toTimeFromClientX(ev.clientX)
+                                  setDragTip({x: ev.clientX, y: ev.clientY-28, text: `← ${formatHMSms(t)}`})
+                                  updateSegmentTime(seg.id, seg.start, Math.max(t, seg.start + MIN_DUR))
+                                }
+                                const onUp = (ev: PointerEvent) => {
+                                  try { (e.target as Element).releasePointerCapture?.((ev as any).pointerId) } catch {}
+                                  dragRef.current = null; setDragTip(null)
+                                  window.removeEventListener('pointermove', onMove)
+                                  window.removeEventListener('pointerup', onUp)
+                                }
+                                window.addEventListener('pointermove', onMove)
+                                window.addEventListener('pointerup', onUp)
+                              }} />
+                            </div>
                           )
                         }) : 
                         // Show empty track when no RTTM
@@ -654,6 +854,17 @@ export default function App(){
                 {tooltip.text}
               </div>
             )}
+            {dragTip && (
+              <div style={{position:'fixed', left: dragTip.x, top: dragTip.y, background:'#0b1220', border:'1px solid #2a3040', padding:'6px 8px', borderRadius:6, fontSize:12, pointerEvents:'none'}}>
+                {dragTip.text}
+              </div>
+            )}
+            {ctxMenu && (
+              <div className="context-menu" style={{left: ctxMenu.x, top: ctxMenu.y}} onClick={(e)=> e.stopPropagation()}>
+                <button className="menu-item" onClick={()=>{ setConfirmDelete({open:true, segId: ctxMenu.segId}); setCtxMenu(null) }}>删除</button>
+                <button className="menu-item" onClick={()=> setCtxMenu(null)}>取消</button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -663,16 +874,30 @@ export default function App(){
             <div style={{display:'grid', gridTemplateRows: (hasRTTM && hasSRT) ? '4fr 6fr' : '1fr', gap:16, height:'100%'}}>
               {hasRTTM && (
                 <div className="card fade-in" style={{minHeight:0, overflow:'auto'}}>
-                  <div style={{fontWeight:700, marginBottom:8}}>Speakers</div>
+                  <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                    <div style={{fontWeight:700}}>Speakers</div>
+                    <button className="btn" onClick={()=>{
+                      const idx = speakers.length+1
+                      const palette = ['#3B82F6','#EF4444','#10B981','#F59E0B','#8B5CF6','#06B6D4','#84CC16','#EC4899','#14B8A6','#F472B6']
+                      const color = palette[(idx-1)%palette.length]
+                      const id = `speaker${idx}`
+                      setSpeakers(prev => [...prev, {id, name: id, color, visible: true}])
+                    }}><Plus size={14}/>添加</button>
+                  </div>
                   <div className="grid" >
                     {speakers.length===0 && <div className="badge-sm">No RTTM loaded</div>}
                     {speakers.map(spk=> (
                       <div key={spk.id} className={'legend-item ' + (spk.visible? '' : 'hidden')}>
-                        <div className="color-dot" style={{background: spk.color}}/>
-                        <div style={{flex:1}}>{spk.name}</div>
-                        <button className="btn icon" onClick={()=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, visible: !s.visible}: s))}>
+                        <input type="color" value={spk.color} onChange={e=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, color: e.target.value}: s))} style={{width:24, height:24, border:'none', background:'transparent', padding:0}}/>
+                        <input value={spk.name} onChange={e=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, name: e.target.value}: s))}
+                          style={{flex:1, background:'#0f141b', border:'1px solid var(--border)', color:'var(--text)', borderRadius:6, padding:'6px 8px'}} />
+                        <button className="btn icon" title={spk.visible? '隐藏' : '显示'} onClick={()=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, visible: !s.visible}: s))}>
                           {spk.visible ? <Eye size={14}/> : <EyeOff size={14}/>}
                         </button>
+                        <button className="btn icon" title="删除" onClick={()=>{
+                          setSpeakers(prev => prev.filter(s=> s.id!==spk.id))
+                          setSegments(prev => prev.filter(seg=> seg.speakerId!==spk.id))
+                        }}><Trash2 size={14}/></button>
                       </div>
                     ))}
                   </div>
@@ -737,6 +962,28 @@ export default function App(){
           )}
         </div>
       </div>
+      {/* Delete confirmation modal */}
+      {confirmDelete?.open && (
+        <div className="modal-backdrop" onClick={()=> setConfirmDelete(null)}>
+          <div className="modal" onClick={(e)=> e.stopPropagation()}>
+            <div style={{fontWeight:700, marginBottom:8}}>确认删除</div>
+            <div className="badge-sm" style={{marginBottom:12}}>删除后该时间段将被移除（可撤销）。</div>
+            <div className="row" style={{justifyContent:'flex-end', gap:8}}>
+              <button className="btn" onClick={()=> setConfirmDelete(null)}>取消</button>
+              <button className="btn primary" onClick={()=>{ if(confirmDelete) removeTimeSegment(confirmDelete.segId); setConfirmDelete(null) }}>删除</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Undo toast */}
+      {toast && (
+        <div className="toast">
+          <span>{toast.message}</span>
+          {toast.onAction && (
+            <button className="link" onClick={toast.onAction}>{toast.actionLabel || '操作'}</button>
+          )}
+        </div>
+      )}
     </div>
   )
 }
