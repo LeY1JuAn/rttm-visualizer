@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Eye, EyeOff, FileAudio, FileVideo, FileText, Download, Subtitles, Github, Plus, Trash2 } from 'lucide-react'
+import { computeDER, type ErrorInterval, type DERMetrics } from './utils'
 
 type MediaType = 'audio' | 'video'
 
@@ -47,6 +48,8 @@ interface Speaker {
   visible: boolean
 }
 
+
+
 function formatTime(sec:number){
   const m = Math.floor(sec/60)
   const s = Math.floor(sec%60).toString().padStart(2,'0')
@@ -58,9 +61,12 @@ function formatHMSms(seconds: number){
   const t = Math.abs(seconds)
   const hours = Math.floor(t/3600)
   const minutes = Math.floor((t%3600)/60)
-  const secs = Math.floor(t%60)
-  const ms = Math.round((t - Math.floor(t)) * 1000)
-  return `${sign}${hours.toString().padStart(2,'0')}:${minutes.toString().padStart(2,'0')}:${secs.toString().padStart(2,'0')}.${ms.toString().padStart(3,'0')}`
+  const secs = t%60
+  if(hours > 0) {
+    return `${sign}${hours}:${minutes.toString().padStart(2,'0')}:${secs.toFixed(1).padStart(4,'0')}`
+  } else {
+    return `${sign}${minutes}:${secs.toFixed(1).padStart(4,'0')}`
+  }
 }
 
 function parseSRT(text: string): Subtitle[] {
@@ -120,8 +126,8 @@ const sampleVideo = "https://videos.pexels.com/video-files/30333849/13003128_256
 
 // Load local defaults from exp/ using Vite glob imports
 // RTTM as raw text; media as URLs
-const defaultRttmFiles = import.meta.glob('/exp/rttm/*.rttm', { eager: true, as: 'raw' }) as Record<string, string>
-const defaultMediaFiles = import.meta.glob('/exp/raw/*.{mp4,webm,mp3,wav,m4a}', { eager: true, as: 'url' }) as Record<string, string>
+const defaultRttmFiles = import.meta.glob('/exp/rttm/*.rttm', { eager: true, query: '?raw', import: 'default' }) as Record<string, string>
+const defaultMediaFiles = import.meta.glob('/exp/raw/*.{mp4,webm,mp3,wav,m4a}', { eager: true, query: '?url', import: 'default' }) as Record<string, string>
 
 export default function App(){
   const [title] = useState('RTTM Visualizer') // 1) Title updated
@@ -132,9 +138,16 @@ export default function App(){
   const [zoom, setZoom] = useState(1)
   const [media, setMedia] = useState<MediaFile|null>({ id:'sample', name:'sample.mp4', type:'video', url: sampleVideo })
   const [rttm, setRTTM] = useState<RTTMFile|null>(null)
+  const [refRTTM, setRefRTTM] = useState<RTTMFile|null>(null)
   const [srt, setSRT] = useState<SRTFile|null>(null)
   const [segments, setSegments] = useState<Segment[]>([])
+  const [refSegments, setRefSegments] = useState<Segment[]>([])
+  const [ghostSeg, setGhostSeg] = useState<{speakerId:string; start:number; end:number} | null>(null)
   const [speakers, setSpeakers] = useState<Speaker[]>([])
+  const [derOverlay, setDerOverlay] = useState<ErrorInterval[]>([])
+  const [metrics, setMetrics] = useState<DERMetrics | null>(null)
+  const [showDER, setShowDER] = useState<boolean>(true)
+  const [showRefTrack, setShowRefTrack] = useState<boolean>(true)
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightCollapsed, setRightCollapsed] = useState(false)
   const centerRef = useRef<HTMLDivElement>(null)
@@ -170,21 +183,28 @@ export default function App(){
   // per-section upload inputs
   const mediaInputRef = useRef<HTMLInputElement>(null)
   const rttmInputRef = useRef<HTMLInputElement>(null)
+  const refRttmInputRef = useRef<HTMLInputElement>(null)
   const srtInputRef = useRef<HTMLInputElement>(null)
   const onDrop = useCallback((e: React.DragEvent)=>{
     e.preventDefault(); setDragOver(false)
     const files = Array.from(e.dataTransfer.files)
     handleFiles(files)
   },[])
-  function handleFiles(files: File[]){
+  function handleFiles(files: File[], target?: 'sys'|'ref'){
     for(const f of files){
       if(f.name.toLowerCase().endsWith('.rttm')){
         const url = URL.createObjectURL(f)
         const reader = new FileReader()
         reader.onload = () => {
           const {segments, speakers} = parseRTTM(String(reader.result))
-          setSegments(segments); setSpeakers(speakers)
-          setRTTM({ id: crypto.randomUUID(), name:f.name, url, matched: true })
+          const isRefTarget = (target==='ref') || (/\bref\b/i.test(f.name)) || (!!rttm && !refRTTM)
+          if(isRefTarget){
+            setRefSegments(segments)
+            setRefRTTM({ id: crypto.randomUUID(), name:f.name, url, matched: true })
+          } else {
+            setSegments(segments); setSpeakers(speakers)
+            setRTTM({ id: crypto.randomUUID(), name:f.name, url, matched: true })
+          }
         }
         reader.readAsText(f)
       } else if(f.name.toLowerCase().endsWith('.srt')){
@@ -273,6 +293,7 @@ export default function App(){
 
   // right panel auto collapse/expand logic based on data presence
   const hasRTTM = useMemo(()=> (!!rttm) || speakers.length>0, [rttm, speakers.length])
+  const hasRef = useMemo(()=> (!!refRTTM) || refSegments.length>0, [refRTTM, refSegments.length])
   const hasSRT = useMemo(()=> !!srt, [srt])
   useEffect(()=>{
     if(!hasRTTM && !hasSRT) setRightCollapsed(true)
@@ -366,19 +387,43 @@ export default function App(){
   // keyboard
   useEffect(()=>{
     const onKey = (e: KeyboardEvent) => {
-      if(e.code === 'Space'){ e.preventDefault(); togglePlay() }
-      if(e.key === 'ArrowLeft') seek(currentTime - 1)
-      if(e.key === 'ArrowRight') seek(currentTime + 1)
+      if(e.code === 'Space'){ console.log('Space'); e.preventDefault(); togglePlay() }
+      if(e.key === 'ArrowLeft'){ console.log('ArrowLeft'); seek(currentTime - 1) }
+      if(e.key === 'ArrowRight'){ console.log('ArrowRight'); seek(currentTime + 1) }
       if((e.ctrlKey||e.metaKey) && (e.key==='=' || e.key==='+')) zoomIn()
       if((e.ctrlKey||e.metaKey) && e.key==='-') zoomOut()
+      if(e.key === 'Delete' || e.key === 'Backspace'){
+        console.log('Delete/Backspace pressed, selectedSegId=', selectedSegId)
+        // Ignore Delete when user is typing in an editable element
+        const active = document.activeElement as HTMLElement | null
+        const isEditable = !!active && (
+          active.tagName === 'INPUT' ||
+          active.tagName === 'TEXTAREA' ||
+          active.isContentEditable ||
+          !!active.closest('input, textarea, [contenteditable="true"]')
+        )
+        if(isEditable){ console.log('Editable focused, skip'); return }
+        if(selectedSegId && !confirmDelete){
+          e.preventDefault();
+          console.log('Open confirm delete for', selectedSegId)
+          setConfirmDelete({ open: true, segId: selectedSegId })
+        } else { console.log('No segment selected, ignore delete') }
+      }
+      if(confirmDelete?.open && e.key === 'Enter'){
+        console.log('Enter confirm delete')
+        e.preventDefault()
+        const targetId = confirmDelete.segId
+        removeTimeSegment(targetId)
+        setConfirmDelete(null)
+      }
     }
     window.addEventListener('keydown', onKey)
     return ()=> window.removeEventListener('keydown', onKey)
-  }, [currentTime, duration])
+  }, [currentTime, duration, selectedSegId, confirmDelete])
 
   // timeline dims
   const pxPerSec = 80 * zoom
-  const timelineWidth = Math.max(600, Math.ceil((duration||120) * pxPerSec))
+  const timelineWidth = Math.max(400, Math.ceil((duration||60) * pxPerSec))
   
   // Calculate optimal time division based on zoom level
   const timeDivision = useMemo(() => {
@@ -391,11 +436,14 @@ export default function App(){
     return 5                   // 5s
   }, [zoom])
 
-  const trackCount = speakers.length>0 ? speakers.length : 10
-  const timelineMinHeight = 24 + trackCount * 28
+  const trackCount = speakers.length>0 ? speakers.length : Math.min(4, 10) // 默认最多显示4个空轨道
+  const hasRefTrackVisible = showRefTrack && refSegments.length > 0
+  const actualTrackCount = trackCount + (hasRefTrackVisible ? 1 : 0)
+  const timelineMinHeight = 24 + 56 + Math.max(2, actualTrackCount) * 28 // ruler + wave + tracks
 
   // click timeline seek
   const waveRef = useRef<HTMLDivElement>(null)
+  const waveCanvasRef = useRef<HTMLCanvasElement>(null)
   const onClickTimeline = (e: React.MouseEvent) => {
     const el = waveRef.current; if(!el) return
     const rect = el.getBoundingClientRect()
@@ -559,7 +607,7 @@ export default function App(){
 
   // export project (segments + speakers) JSON
   const exportJSON = () => {
-    const data = { media, rttm, speakers, segments }
+    const data = { media, rttm, speakers, segments, refRTTM, refSegments }
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'})
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -574,8 +622,9 @@ export default function App(){
       .sort((a,b)=> a.start-b.start)
       .map(seg => {
         const dur = Math.max(MIN_DUR, seg.end - seg.start)
+        const label = speakers.find(s=> s.id===seg.speakerId)?.name || seg.speakerId
         // SPEAKER <file_id> <chnl> <tbeg> <tdur> <ortho> <stype> <name> <conf>
-        return `SPEAKER ${fileId} 1 ${seg.start.toFixed(3)} ${dur.toFixed(3)} <NA> <NA> ${seg.speakerId} <NA>`
+        return `SPEAKER ${fileId} 1 ${seg.start.toFixed(3)} ${dur.toFixed(3)} <NA> <NA> ${label} <NA>`
       })
       .join('\n')
     const blob = new Blob([lines+'\n'], {type:'text/plain'})
@@ -584,6 +633,103 @@ export default function App(){
     a.href = url; a.download = `${fileId || 'segments'}.rttm`; a.click()
     URL.revokeObjectURL(url)
   }
+
+  // Waveform generation from media
+  const [wavePeaks, setWavePeaks] = useState<Float32Array | null>(null)
+  const [waveFailed, setWaveFailed] = useState<boolean>(false)
+  useEffect(()=>{
+    let aborted = false
+    async function buildWave(){
+      setWaveFailed(false)
+      setWavePeaks(null)
+      const url = media?.url
+      if(!url) return
+      try {
+        const res = await fetch(url)
+        const buf = await res.arrayBuffer()
+        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
+        const audioBuf = await ctx.decodeAudioData(buf.slice(0))
+        if(aborted) return
+        const ch0 = audioBuf.getChannelData(0)
+        const ch1 = audioBuf.numberOfChannels>1 ? audioBuf.getChannelData(1) : null
+        const totalSec = audioBuf.duration
+        const samplesPerSec = 50
+        const totalSamples = Math.max(1, Math.min(200000, Math.floor(totalSec * samplesPerSec)))
+        const blockSize = Math.max(1, Math.floor(ch0.length / totalSamples))
+        const peaks = new Float32Array(totalSamples)
+        for(let i=0;i<totalSamples;i++){
+          const start = i * blockSize
+          const end = Math.min(ch0.length, start + blockSize)
+          let maxAbs = 0
+          for(let j=start;j<end;j++){
+            const v0 = Math.abs(ch0[j])
+            const v1 = ch1? Math.abs(ch1[j]) : 0
+            const v = v0>v1? v0 : v1
+            if(v>maxAbs) maxAbs = v
+          }
+          peaks[i] = maxAbs
+        }
+        setWavePeaks(peaks)
+        ctx.close()
+      } catch (e) {
+        setWaveFailed(true)
+      }
+    }
+    buildWave()
+    return ()=>{ aborted = true }
+  }, [media?.url])
+
+  // Draw waveform on canvas sized to timeline width
+  useEffect(()=>{
+    const canvas = waveCanvasRef.current
+    if(!canvas) return
+    const ctx = canvas.getContext('2d')
+    if(!ctx) return
+    const W = Math.max(1, timelineWidth)
+    const H = 56
+    const dpr = (window.devicePixelRatio||1)
+    canvas.width = Math.floor(W * dpr)
+    canvas.height = Math.floor(H * dpr)
+    canvas.style.width = W + 'px'
+    canvas.style.height = H + 'px'
+    ctx.setTransform(1,0,0,1,0,0)
+    ctx.scale(dpr, dpr)
+    ctx.clearRect(0,0,W,H)
+    if(!wavePeaks || wavePeaks.length===0){
+      ctx.strokeStyle = '#2a3040'
+      ctx.beginPath()
+      ctx.moveTo(0, H/2)
+      ctx.lineTo(W, H/2)
+      ctx.stroke()
+      return
+    }
+    ctx.fillStyle = '#0e1016'
+    ctx.fillRect(0,0,W,H)
+    const mid = H/2
+    ctx.strokeStyle = '#3b82f6'
+    ctx.globalAlpha = 0.7
+    ctx.beginPath()
+    const samples = wavePeaks.length
+    for(let x=0;x<W;x++){
+      const t = x / pxPerSec
+      const idx = Math.min(samples-1, Math.max(0, Math.floor(t * 50)))
+      const amp = wavePeaks[idx] || 0
+      const h = Math.max(1, amp * (H-8))
+      ctx.moveTo(x, mid - h/2)
+      ctx.lineTo(x, mid + h/2)
+    }
+    ctx.stroke()
+    ctx.globalAlpha = 1
+  }, [wavePeaks, timelineWidth, pxPerSec])
+
+
+
+  useEffect(()=>{
+    if(refSegments.length===0 || segments.length===0){ setDerOverlay([]); setMetrics(null); return }
+    const { intervals, metrics } = computeDER(refSegments, segments)
+    setDerOverlay(intervals)
+    setMetrics(metrics)
+  }, [refSegments, segments])
 
   return (
     <div style={{display:'flex', flexDirection:'column', height:'100%'}}>
@@ -611,7 +757,7 @@ export default function App(){
       </div>
 
       <div className="layout">
-        {/* Left panel: uploads and files */}
+        {/* Left panel: uploads and DER */}
         <div className={"panel section" + (leftCollapsed ? ' collapsed' : '')}
           onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}}
           onDragLeave={()=>setDragOver(false)}
@@ -619,7 +765,7 @@ export default function App(){
         >
           {!leftCollapsed && null}
 
-          <div className="section">
+          <div className="section" onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{ e.preventDefault(); setDragOver(false); if(e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files), 'sys') }}>
             <div className="card">
               <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
                 <div style={{fontWeight:700}}>Media</div>
@@ -639,13 +785,13 @@ export default function App(){
             </div>
           </div>
 
-          <div className="section">
+          <div className="section" onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{ e.preventDefault(); setDragOver(false); if(e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files), 'sys') }}>
             <div className="card">
               <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
                 <div style={{fontWeight:700}}>RTTM</div>
                 <button className="btn" onClick={()=> rttmInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
                 <input ref={rttmInputRef} type="file" style={{display:'none'}} accept=".rttm"
-                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))} />
+                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'sys')} />
               </div>
               {rttm ? (
                 <div className="file-list-item">
@@ -658,6 +804,63 @@ export default function App(){
               ) : <div className="badge-sm">Drop an .rttm file</div>}
             </div>
           </div>
+
+          <div className="section" onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{ e.preventDefault(); setDragOver(false); if(e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files), 'ref') }}>
+            <div className="card">
+              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                <div style={{fontWeight:700}}>Ref RTTM</div>
+                <button className="btn" onClick={()=> refRttmInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
+                <input ref={refRttmInputRef} type="file" style={{display:'none'}} accept=".rttm"
+                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'ref')} />
+              </div>
+              {refRTTM ? (
+                <div className="file-list-item">
+                  <FileText className="file-icon"/>
+                  <div style={{overflow:'hidden'}}>
+                    <div style={{fontSize:14, whiteSpace:'nowrap', textOverflow:'ellipsis', overflow:'hidden'}}>{refRTTM.name}</div>
+                    <div className="badge-sm">Segments: {refSegments.length} · Locked</div>
+                  </div>
+                </div>
+              ) : <div className="badge-sm">Optional reference .rttm for DER</div>}
+
+              {/* Inline DER inside Ref RTTM card */}
+              {refRTTM && rttm && metrics && (
+                <div style={{marginTop:12}}>
+                  <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                    <div style={{fontWeight:700}}>DER</div>
+                    <div className="row">
+                      <label className="badge-sm" style={{display:'inline-flex', alignItems:'center', gap:6}}>
+                        <input type="checkbox" checked={showRefTrack} onChange={e=> setShowRefTrack(e.target.checked)} /> Ref
+                      </label>
+                      <label className="badge-sm" style={{display:'inline-flex', alignItems:'center', gap:6}}>
+                        <input type="checkbox" checked={showDER} onChange={e=> setShowDER(e.target.checked)} /> Overlay
+                      </label>
+                    </div>
+                  </div>
+                  <div className="grid two">
+                    <div className="metric" title="Missed Speech: 参考有语音，系统无语音">
+                      <div className="badge-sm" style={{color:'#60a5fa'}}>Missed Speech</div>
+                      <div style={{fontSize:18, fontWeight:700, color:'#60a5fa'}}>{metrics.MS.toFixed(2)}%</div>
+                    </div>
+                    <div className="metric" title="False Alarm: 系统有语音，参考无语音">
+                      <div className="badge-sm" style={{color:'#ef4444'}}>False Alarm</div>
+                      <div style={{fontSize:18, fontWeight:700, color:'#ef4444'}}>{metrics.FA.toFixed(2)}%</div>
+                    </div>
+                    <div className="metric" title="Speaker Error: 双方都为语音但说话人不匹配">
+                      <div className="badge-sm" style={{color:'#f59e0b'}}>Speaker Error Rate</div>
+                      <div style={{fontSize:18, fontWeight:700, color:'#f59e0b'}}>{metrics.SER.toFixed(2)}%</div>
+                    </div>
+                    <div className="metric" title="DER = Missed Speech + False Alarm + Speaker Error Rate">
+                      <div className="badge-sm">DER</div>
+                      <div style={{fontSize:20, fontWeight:800}}>{metrics.DER.toFixed(2)}%</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          
 
           <div className="section">
             <div className="card">
@@ -707,32 +910,40 @@ export default function App(){
             <div style={{width:64, textAlign:'right'}} className="badge-sm">{zoom.toFixed(2)}x</div>
           </div>
 
-          {/* Timeline area with fixed default height to avoid large empty space */}
-          <div className="timeline-wrap" style={{height: timelineMinHeight, flex: '0 0 auto', display:'flex', flexDirection:'column', justifyContent:'flex-end', padding: '0 12px'}}>
-            <div className="timeline" style={{height: timelineMinHeight}} ref={waveRef} onClick={onClickTimeline}
+          {/* Timeline area with dynamic height */}
+          <div className="timeline-wrap" style={{flex: '1 1 auto', minHeight: timelineMinHeight, display:'flex', flexDirection:'column', padding: '0 12px'}}>
+            <div className="timeline" style={{flex: '1 1 auto', minHeight: timelineMinHeight}} ref={waveRef} onClick={onClickTimeline}
               onPointerDown={onTimelinePointerDown}
               onPointerMove={onTimelinePointerMove}
               onPointerUp={onTimelinePointerUp}
             >
               {/* RULER */}
-              <div className="ruler" style={{width: timelineWidth}}>
-                {Array.from({length: Math.ceil((duration||0)/timeDivision)+1}).map((_,i)=>{
-                  const left = i * timeDivision * pxPerSec
+              <div className="ruler" style={{width: '100%', minWidth: timelineWidth}}>
+                {Array.from({length: Math.ceil((duration||0)/timeDivision)}).map((_,i)=>{
+                  const time = i * timeDivision
+                  const left = time * pxPerSec
                   const major = i % 5 === 0
+                  // 避免最后一个标签挤出边界
+                  const isLastLabel = time >= (duration||0) - timeDivision * 0.5
                   return (
                     <div key={`major-${i}`}>
                       <div className="tick" style={{left, height: '100%', opacity: 1}}></div>
-                      {major && <div className="label" style={{left}}>{formatHMSms(i * timeDivision)}</div>}
+                      {major && !isLastLabel && <div className="label" style={{left}}>{formatHMSms(time)}</div>}
                     </div>
                   )
                 })}
+                {/* 最后时间标签，右对齐 */}
+                {duration && duration > 0 && (
+                  <div className="label" style={{right: 0, transform: 'translateX(0)'}}>{formatHMSms(duration)}</div>
+                )}
                 {(()=>{
                   const minorDiv = timeDivision/5
                   if (minorDiv <= 0) return null
-                  const arr = Array.from({length: Math.ceil((duration||0)/minorDiv)+1})
+                  const arr = Array.from({length: Math.ceil((duration||0)/minorDiv)})
                   return arr.map((_,i)=>{
-                    const left = i * minorDiv * pxPerSec
-                    const isMajorAligned = Math.abs((i*minorDiv) % timeDivision) < 1e-6
+                    const time = i * minorDiv
+                    const left = time * pxPerSec
+                    const isMajorAligned = Math.abs(time % timeDivision) < 1e-6
                     if (isMajorAligned) return null
                     return (
                       <div key={`minor-${i}`} className="tick" style={{left, height: '40%', opacity: 0.4}}></div>
@@ -740,44 +951,47 @@ export default function App(){
                   })
                 })()}
               </div>
+              {/* Full-height playhead spanning ruler and tracks */}
+              <div className="playhead" style={{left: `${currentTime * pxPerSec}px`}} />
+
+              {/* Waveform */}
+              <div className="wave" style={{width: '100%', minWidth: timelineWidth}}>
+                <canvas ref={waveCanvasRef} />
+                {waveFailed && (
+                  <div className="badge-sm" style={{position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center'}}>Waveform unavailable</div>
+                )}
+              </div>
 
               {/* Tracks container fills remaining height */}
-              <div className="tracks" style={{width: timelineWidth}}>
-                <div className="playhead-long" style={{left: `${currentTime * pxPerSec}px`}}/>
+              <div className="tracks" style={{width: '100%', minWidth: timelineWidth, flex: '1 1 auto', minHeight: actualTrackCount * 28}}>
                 {/* SPEAKER TRACKS (vertically scrollable) */}
                 {allTracks.map(spk=>{
                   const hidden = speakers.length > 0 ? !spk.visible : false
                   return (
-                    <div key={spk.id} className="track" style={{width: timelineWidth, opacity: hidden?0.3:1}}
-                      onPointerDown={(e)=>{
-                        // create new seg in empty area
-                        if((e.target as HTMLElement).closest('.seg')) return
-                        e.stopPropagation()
+                    <div key={spk.id} className="track" style={{width: '100%', minWidth: timelineWidth, opacity: hidden?0.3:1}}
+                      onMouseMove={(e)=>{
                         if(speakers.length===0) return
+                        if((e.target as HTMLElement).closest('.seg')) return
                         const t = toTimeFromClientX(e.clientX)
+                        const dur = 0.2
+                        const start = Math.max(0, Math.min((duration||0) - dur, t - dur/2))
+                        const end = Math.min(duration||start+dur, start + dur)
+                        setGhostSeg({ speakerId: spk.id, start, end })
+                      }}
+                      onMouseLeave={()=> setGhostSeg(null)}
+                      onClick={(e)=>{
+                        if((e.target as HTMLElement).closest('.seg')) return
+                        if(speakers.length===0) return
+                        // prefer ghost position if present
+                        let t = toTimeFromClientX(e.clientX)
+                        if(ghostSeg && ghostSeg.speakerId===spk.id){ t = ghostSeg.start }
                         const newId = createSegmentAt(spk.id, t)
-                        dragRef.current = { type: 'create', speakerId: spk.id, segId: newId, anchorTime: t }
-                        setDragTip({x: e.clientX, y: e.clientY-28, text: `${spk.name}  ${formatHMSms(t)}`})
-                        const onMove = (ev: PointerEvent) => {
-                          const time = toTimeFromClientX(ev.clientX)
-                          setDragTip({x: ev.clientX, y: ev.clientY-28, text: `${spk.name}  ${formatHMSms(Math.min(time, t))} – ${formatHMSms(Math.max(time, t))}`})
-                          setSegments(prev => prev.map(s=> s.id===newId ? ({...s, start: Math.min(time, t), end: Math.max(time, t)}) : s))
-                        }
-                        const onUp = () => {
-                          const state = dragRef.current; if(!state) return
-                          const segId = state.segId!
-                          const finalSeg = segmentsRef.current.find(s=>s.id===segId)
-                          const cur = finalSeg || null
-                          if(cur){ updateSegmentTime(segId, cur.start, cur.end) }
-                          dragRef.current = null
-                          setDragTip(null)
-                          window.removeEventListener('pointermove', onMove)
-                          window.removeEventListener('pointerup', onUp)
-                        }
-                        window.addEventListener('pointermove', onMove)
-                        window.addEventListener('pointerup', onUp)
+                        setSelectedSegId(newId)
                       }}
                     >
+                      {ghostSeg && ghostSeg.speakerId===spk.id && (
+                        <div className="seg ghost" style={{left: ghostSeg.start * pxPerSec, width: (ghostSeg.end - ghostSeg.start) * pxPerSec}} />
+                      )}
                       {speakers.length > 0 ? 
                         segments.filter(s=>s.speakerId===spk.id).map(seg=>{
                           const left = seg.start * pxPerSec
@@ -847,6 +1061,46 @@ export default function App(){
                     </div>
                   )
                 })}
+
+                {/* Reference track overlay (locked, gray) */}
+                {showRefTrack && refSegments.length>0 && (
+                  <div className="track" style={{width: '100%', minWidth: timelineWidth, background:'#0f121b'}}>
+                    {refSegments.map(seg=>{
+                      const left = seg.start * pxPerSec
+                      const w = (seg.end - seg.start) * pxPerSec
+                      return (
+                        <div key={'ref-'+seg.id} className={'seg'}
+                          style={{left, width:w, background:'#6b7280', opacity:0.5}}
+                          onMouseEnter={(e)=>{
+                            setTooltip({x: e.clientX, y: e.clientY-30, text: `REF ${seg.speakerId}  ${formatHMSms(seg.start)}–${formatHMSms(seg.end)}`})
+                          }}
+                          onMouseLeave={()=>setTooltip(null)}
+                        />
+                      )
+                    })}
+                    <div className="badge-sm" style={{position:'absolute', left:6, top:6, color:'#cbd5e1'}}>Reference</div>
+                  </div>
+                )}
+
+                {/* DER overlay */}
+                {showDER && derOverlay.length>0 && (
+                  <div className="der-overlay" style={{width: '100%', minWidth: timelineWidth}}>
+                    {derOverlay.map((iv, idx)=>{
+                      if(iv.type==='OK') return null
+                      const left = iv.start * pxPerSec
+                      const w = Math.max(1, (iv.end - iv.start) * pxPerSec)
+                      const color = iv.type==='MS'? '#60a5fa' : iv.type==='FA'? '#ef4444' : '#f59e0b'
+                      const label = iv.type
+                      return (
+                        <div key={idx} className={`der-chunk ${label.toLowerCase()}`}
+                          style={{left, width:w, background: color, opacity: 0.18, position:'absolute', top:0, bottom:0}}
+                          onMouseEnter={(e)=> setTooltip({x:e.clientX, y:e.clientY-30, text: `${label}  ${formatHMSms(iv.start)}–${formatHMSms(iv.end)} (${formatHMSms(iv.end-iv.start)})`})}
+                          onMouseLeave={()=> setTooltip(null)}
+                        />
+                      )
+                    })}
+                  </div>
+                )}
               </div>
             </div>
             {tooltip && (
@@ -873,7 +1127,7 @@ export default function App(){
           {!rightCollapsed && (
             <div style={{display:'grid', gridTemplateRows: (hasRTTM && hasSRT) ? '4fr 6fr' : '1fr', gap:16, height:'100%'}}>
               {hasRTTM && (
-                <div className="card fade-in" style={{minHeight:0, overflow:'auto'}}>
+                                 <div className="card fade-in" style={{minHeight:0, overflowY:'auto'}}>
                   <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
                     <div style={{fontWeight:700}}>Speakers</div>
                     <button className="btn" onClick={()=>{
@@ -890,7 +1144,7 @@ export default function App(){
                       <div key={spk.id} className={'legend-item ' + (spk.visible? '' : 'hidden')}>
                         <input type="color" value={spk.color} onChange={e=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, color: e.target.value}: s))} style={{width:24, height:24, border:'none', background:'transparent', padding:0}}/>
                         <input value={spk.name} onChange={e=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, name: e.target.value}: s))}
-                          style={{flex:1, background:'#0f141b', border:'1px solid var(--border)', color:'var(--text)', borderRadius:6, padding:'6px 8px'}} />
+                          style={{flex:1, minWidth:0, background:'#0f141b', border:'1px solid var(--border)', color:'var(--text)', borderRadius:6, padding:'6px 8px'}} />
                         <button className="btn icon" title={spk.visible? '隐藏' : '显示'} onClick={()=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, visible: !s.visible}: s))}>
                           {spk.visible ? <Eye size={14}/> : <EyeOff size={14}/>}
                         </button>
@@ -970,7 +1224,7 @@ export default function App(){
             <div className="badge-sm" style={{marginBottom:12}}>删除后该时间段将被移除（可撤销）。</div>
             <div className="row" style={{justifyContent:'flex-end', gap:8}}>
               <button className="btn" onClick={()=> setConfirmDelete(null)}>取消</button>
-              <button className="btn primary" onClick={()=>{ if(confirmDelete) removeTimeSegment(confirmDelete.segId); setConfirmDelete(null) }}>删除</button>
+              <button className="btn primary" autoFocus onClick={()=>{ if(confirmDelete) removeTimeSegment(confirmDelete.segId); setConfirmDelete(null) }}>删除</button>
             </div>
           </div>
         </div>
