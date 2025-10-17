@@ -963,7 +963,15 @@ export default function App(){
               </div>
 
               {/* Tracks container fills remaining height */}
-              <div className="tracks" style={{width: '100%', minWidth: timelineWidth, flex: '1 1 auto', minHeight: actualTrackCount * 28}}>
+              <div className="tracks" style={{
+                width: '100%', 
+                minWidth: timelineWidth, 
+                flex: '1 1 auto', 
+                minHeight: Math.min(200, actualTrackCount * 28), // 设置最小高度，但不超过 200px
+                maxHeight: '40vh', // 最大高度为视口高度的 40%
+                overflowY: 'auto', // 启用垂直滚动
+                paddingRight: '8px' // 为滚动条留出空间，避免内容被遮挡
+              }}>
                 {/* SPEAKER TRACKS (vertically scrollable) */}
                 {allTracks.map(spk=>{
                   const hidden = speakers.length > 0 ? !spk.visible : false
